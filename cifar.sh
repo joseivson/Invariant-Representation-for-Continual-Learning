@@ -1,0 +1,1 @@
+python main.py --img_size 32 --channels 3 --dataset cifar --conv True --results_path results_conv --n_hidden_cvae 2048

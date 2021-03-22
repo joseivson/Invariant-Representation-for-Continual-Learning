@@ -5,8 +5,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import copy
-from scipy.misc import imsave
-from scipy.misc import imresize
+import torch
 
 def get_train_loader(train_dataset,batch_size):
     train_loader = DataLoader(
@@ -25,14 +24,24 @@ def get_test_loader(test_dataset,test_batch_size):
         pin_memory=True)
     return test_loader
 
-def load_data():
+def load_data(dataset, crop_gray=False):
     transform = transforms.Compose([transforms.ToTensor()])
-    full_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST('./data', train=False, transform=transform)
+    if dataset == 'mnist':
+        full_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+        test_dataset = datasets.MNIST('./data', train=False, transform=transform)
+    elif dataset == 'cifar':
+        if crop_gray:
+            transform = transforms.Compose(
+                [transforms.CenterCrop(28),
+                transforms.Grayscale(),
+                transforms.ToTensor()]
+            )
+        full_dataset = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
+        test_dataset = datasets.CIFAR10('./data', train=False, transform=transform)
     return full_dataset,test_dataset
 
-def task_construction(task_labels):
-    full_dataset,test_dataset = load_data()
+def task_construction(task_labels, dataset):
+    full_dataset,test_dataset = load_data(dataset)
     train_dataset = split_dataset_by_labels(full_dataset, task_labels)
     test_dataset = split_dataset_by_labels(test_dataset, task_labels)
     return train_dataset,test_dataset
@@ -43,6 +52,8 @@ def split_dataset_by_labels(dataset, task_labels):
     for labels in task_labels:
         idx = np.in1d(dataset.targets, labels)
         splited_dataset = copy.deepcopy(dataset)
+        if type(splited_dataset.targets) is not torch.Tensor:
+            splited_dataset.targets = torch.Tensor(splited_dataset.targets)
         splited_dataset.targets = splited_dataset.targets[idx]
         splited_dataset.data = splited_dataset.data[idx]
         datasets.append(splited_dataset)

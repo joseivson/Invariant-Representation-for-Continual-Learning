@@ -17,6 +17,7 @@ import itertools
 from model import *
 import data_utils
 import plot_utils
+from sklearn.manifold import TSNE
 
 def parse_args():
     desc = "Pytorch implementation of Learning Invariant Representation for CL (IRCL) on the Split MNIST benchmark"
@@ -26,12 +27,14 @@ def parse_args():
     parser.add_argument("--img_size", type=int, default=28, help="dimensionality of the input image")
     parser.add_argument("--channels", type=int, default=1, help="dimensionality of the input channels")
     parser.add_argument("--n_classes", type=int, default=10, help="total number of classes")
+    parser.add_argument("--dataset", type=str, default="mnist", help="Dataset {cifar, mnist}")
 
     # architecture
     parser.add_argument("--latent_dim", type=int, default=32, help="dimensionality of the latent code")
     parser.add_argument('--n_hidden_cvae', type=int, default=300, help='number of hidden units in conditional variational autoencoder')
     parser.add_argument('--n_hidden_specific', type=int, default=20, help='number of hidden units in the specific module')
     parser.add_argument('--n_hidden_classifier', type=int, default=40, help='number of hidden units in the classification module')
+    parser.add_argument('--conv', type=bool, default=False)
     
     # training parameters
     parser.add_argument('--learn_rate', type=float, default=1e-2, help='learning rate for Adam optimizer')
@@ -67,22 +70,25 @@ def check_args(args):
         os.remove(f)
     return args
 
-def visualize(args, test_loader, encoder, decoder, epoch, n_classes, curr_task_labels, device):
-    plotter = plot_utils.plot_samples(args.results_path, args.n_img_x, args.n_img_y, args.img_size, args.img_size)
+def visualize(args, test_loader, encoder, decoder, epoch, n_classes, curr_task_labels, device, task_id):
+    plotter = plot_utils.plot_samples(args.results_path, args.n_img_x, args.n_img_y, args.img_size, args.img_size, args.channels)
     # plot samples of the reconstructed images from the first batch of the test set of the current task
+    tsne = TSNE()
     for test_batch_idx, (test_data, test_target) in enumerate(test_loader):  
         test_data, test_target = test_data.to(device), test_target.to(device)                  
         x = test_data[0:plotter.n_total_imgs, :]
         x_id = test_target[0:plotter.n_total_imgs]
-        x_id_onehot = get_categorical(x_id,n_classes).to(device)
         encoder.eval()
         decoder.eval()
         with torch.no_grad():
             z,_,_ = encoder(x)
+            x_id_onehot = get_categorical(x_id, n_classes).to(device)
             reconstructed_x = decoder(torch.cat([z, x_id_onehot], dim=1))
-            reconstructed_x = reconstructed_x.reshape(plotter.n_total_imgs, args.img_size, args.img_size)
-            plotter.save_images(x.cpu().data, name="/x_epoch_%02d" %(epoch) + ".jpg")
-            plotter.save_images(reconstructed_x.cpu().data, name="/reconstructed_x_epoch_%02d" %(epoch) + ".jpg")
+            reconstructed_x = reconstructed_x.permute(0,2,3,1) #reshape(plotter.n_total_imgs, args.img_size, args.img_size,args.channels)
+            plotter.save_images(x.permute(0,2,3,1).cpu().data, name="/%02d_x_epoch_%02d" %(task_id, epoch) + ".jpg")
+            plotter.save_images(reconstructed_x.cpu().data, name="/%02d_reconstructed_x_epoch_%02d" %(task_id, epoch) + ".jpg")
+            z_new = tsne.fit_transform(z.cpu().numpy())
+            plotter.scatter(z_new[:,0], z_new[:,1], x_id.cpu().numpy().astype(int), name="/%02d_scatter_epoch_%02d" %(task_id, epoch) + ".jpg")
         break
     
     #plot pseudo random samples from the previous learned tasks
@@ -92,11 +98,14 @@ def visualize(args, test_loader, encoder, decoder, epoch, n_classes, curr_task_l
     decoder.eval()
     with torch.no_grad():
         pseudo_samples = decoder(torch.cat([z,Variable(Tensor(z_id_one_hot))],1))
-        pseudo_samples = pseudo_samples.reshape(plotter.n_total_imgs, args.img_size, args.img_size)
-        plotter.save_images(pseudo_samples.cpu().data, name="/pseudo_sample_epoch_%02d" % (epoch) + ".jpg")
+        z_,_,_ = encoder(pseudo_samples)
+        pseudo_samples = pseudo_samples.permute(0,2,3,1) #.reshape(plotter.n_total_imgs, args.img_size, args.img_size, args.channels)
+        plotter.save_images(pseudo_samples.cpu().data, name="/%02d_pseudo_sample_epoch_%02d" % (task_id, epoch) + ".jpg")
+        z_new = tsne.fit_transform(z_.cpu().numpy())
+        plotter.scatter(z_new[:,0], z_new[:,1], z_id.astype(int), name="/%02d_scatter_pseudo_epoch_%02d" %(task_id, epoch) + ".jpg")
 
 def get_categorical(labels, n_classes=10):
-    cat = np.array(labels.data.tolist())
+    cat = np.array(labels.data.tolist(), dtype=int)
     cat = np.eye(n_classes)[cat].astype('float32')
     cat = torch.from_numpy(cat)
     return Variable(cat)
@@ -128,7 +137,7 @@ def evaluate(encoder, classifier, task_id, device, task_test_loader):
             data, target = data.to(device), target.to(device, dtype=torch.int64)
             n += target.shape[0]
             z_representation,_,_ = encoder(data)
-            model_output = classifier(data.view(data.shape[0], -1), z_representation)
+            model_output = classifier(data, z_representation)
             pred_class = model_output.argmax(dim=1, keepdim=True)
             correct_class += pred_class.eq(target.view_as(pred_class)).sum().item()
 
@@ -137,22 +146,23 @@ def evaluate(encoder, classifier, task_id, device, task_test_loader):
 
     return 100. * correct_class / float(n)
 
-def train(args, optimizer_cvae, optimizer_C, encoder, decoder,classifer, train_loader, test_loader, curr_task_labels, task_id, device):
+def train(args, optimizer_cvae, optimizer_C, encoder, decoder,classifier, train_loader, test_loader, curr_task_labels, task_id, device):
     ## loss ##
     pixelwise_loss = torch.nn.MSELoss(reduction='sum')
     classification_loss = nn.CrossEntropyLoss()  
     encoder.train()
     decoder.train()
-    classifer.train()
+    classifier.train()
     for epoch in range(args.num_epochs):
         for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device) 
+            data, target = data.to(device), target.to(device=device, dtype=int) 
             #---------------------------#
             ## train encoder-decoder ##
             #---------------------------#
             encoder.zero_grad()
             decoder.zero_grad()
-            classifer.zero_grad()
+            classifier.zero_grad()
+            encoded_imgs, z_mu, z_var = encoder(data)
             y_onehot = get_categorical(target, args.n_classes).to(device)
             encoded_imgs,z_mu,z_var = encoder(data)
             decoded_imgs = decoder(torch.cat([encoded_imgs, y_onehot], dim=1))
@@ -167,10 +177,10 @@ def train(args, optimizer_cvae, optimizer_C, encoder, decoder,classifer, train_l
             #---------------------------#
             encoder.zero_grad()
             decoder.zero_grad()
-            classifer.zero_grad()
+            classifier.zero_grad()
             z_representation,_,_ = encoder(data)
             # the classifier includes the specific module
-            outputs = classifer(data.view(data.shape[0], -1), z_representation.detach())
+            outputs = classifier(data, z_representation.detach())
             c_loss = classification_loss(outputs, target)
             c_loss.backward()
             optimizer_C.step()
@@ -183,8 +193,11 @@ def train(args, optimizer_cvae, optimizer_C, encoder, decoder,classifer, train_l
                 print("epoch %d: total_loss %03.2f cvae_loss %03.2f rec_loss %03.2f kl_loss %03.2f c_loss %03.2f" % (epoch, total_loss, cvae_loss.item(), rec_loss.item()/len(data), kl_loss.item(),c_loss.item()))
             
         if  epoch%2==0 or epoch+1 == args.num_epochs:
-           test_acc = evaluate(encoder, classifer, task_id, device, test_loader)
-           visualize(args, test_loader, encoder, decoder, epoch, args.n_classes, curr_task_labels, device)
+            test_acc = evaluate(encoder, classifier, task_id, device, test_loader)
+            visualize(args, test_loader, encoder, decoder, epoch, args.n_classes, curr_task_labels, device, task_id)
+            torch.save(encoder, 'models/encoder.pt')
+            torch.save(decoder, 'models/decoder.pt')
+            torch.save(classifier, 'models/classifier.pt')
 
     return test_acc
 
@@ -206,11 +219,11 @@ def main(args):
     num_tasks = len(task_labels)
     n_classes = args.n_classes
     num_replayed = [5000, 5000, 5000, 5000]
-    train_dataset,test_dataset = data_utils.task_construction(task_labels)
+    train_dataset,test_dataset = data_utils.task_construction(task_labels, args.dataset)
     
     ## MODEL ##
     # Initialize encoder, decoder, specific, and classifier
-    encoder = Encoder(img_shape, args.n_hidden_cvae, args.latent_dim)
+    encoder = Encoder(img_shape, args.n_hidden_cvae, args.latent_dim, conv=args.conv)
     decoder = Decoder(img_shape, args.n_hidden_cvae, args.latent_dim, n_classes, use_label=True)
     classifier = Classifier(img_shape, args.latent_dim, args.n_hidden_specific, args.n_hidden_classifier, n_classes)
     
@@ -229,17 +242,24 @@ def main(args):
     #----- Train the sequence of CL tasks -----#
     #----------------------------------------------------------------------#
     for task_id in range(num_tasks):
-        print("Strat training task#" + str(task_id))
+        print("Start training task#" + str(task_id))
         sys.stdout.flush()
         if task_id>0:            
             # generate pseudo-samples of previous tasks
             gen_x,gen_y = generate_pseudo_samples(device, task_id, args.latent_dim, task_labels, decoder, num_replayed)
+            if args.channels > 1:
+                gen_x = gen_x.reshape([gen_x.shape[0],img_shape[1],img_shape[2],args.channels])
+            else:
             gen_x = gen_x.reshape([gen_x.shape[0],img_shape[1],img_shape[2]])
             train_dataset[task_id-1].data = (gen_x*255).type(torch.uint8)
             train_dataset[task_id-1].targets = Variable(Tensor(gen_y)).type(torch.long)
             # concatenate the pseduo samples of previous tasks with the data of the current task
+            if args.dataset == 'mnist':
             train_dataset[task_id].data = torch.cat((train_dataset[task_id].data,train_dataset[task_id-1].data.cpu()))
             train_dataset[task_id].targets =  torch.cat((train_dataset[task_id].targets, train_dataset[task_id-1].targets.cpu()))
+            else:
+                train_dataset[task_id].data = torch.cat((torch.Tensor(train_dataset[task_id].data),train_dataset[task_id-1].data.cpu().to(torch.float32))).type(torch.uint8).numpy()
+                train_dataset[task_id].targets =  torch.cat((train_dataset[task_id].targets, train_dataset[task_id-1].targets.cpu().to(torch.float32)))
 
         train_loader = data_utils.get_train_loader(train_dataset[task_id], args.batch_size)
         test_loader = data_utils.get_test_loader(test_dataset[task_id], args.test_batch_size)

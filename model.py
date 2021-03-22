@@ -15,22 +15,60 @@ def reparameterization(mu, logvar,latent_dim):
     z = sampled_z * std + mu
     return z
 
-class Encoder(nn.Module):
-    def __init__(self, img_shape, n_hidden, latent_dim):
-        super(Encoder, self).__init__()
+def weight_init(m):
+    if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.zeros_(m.bias)
 
-        self.model = nn.Sequential(
-            nn.Linear(int(np.prod(img_shape)), n_hidden),
-            nn.BatchNorm1d(n_hidden),
-            nn.ReLU(inplace=True),
-        )
+class Encoder(nn.Module):
+    def __init__(self, img_shape, n_hidden, latent_dim, conv=False):
+        super(Encoder, self).__init__()
+        self.conv = conv
+        if conv:
+            self.model = nn.Sequential(
+                nn.Conv2d(img_shape[0], 16, 3, padding=1),
+                nn.BatchNorm2d(16),
+                nn.ReLU(),
+                nn.Conv2d(16, 16, 3, padding=1), 
+                nn.BatchNorm2d(16),
+                nn.ReLU(),
+                nn.MaxPool2d(2,2),
+                nn.Conv2d(16, 32, 3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(),
+                nn.Conv2d(32, 32, 3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(),
+                nn.MaxPool2d(2, 2),
+                nn.Conv2d(32, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                nn.MaxPool2d(2,2),
+                nn.Flatten(),
+            )
+        else:
+            self.model = nn.Sequential(
+                nn.Linear(int(np.prod(img_shape)), n_hidden),
+                nn.BatchNorm1d(n_hidden),
+                nn.ReLU(inplace=True),
+            )
         self.mu = nn.Linear(n_hidden, latent_dim)
         self.logvar = nn.Linear(n_hidden, latent_dim)
         self.latent_dim = latent_dim
-        
-    def forward(self, img):
-        img_flat = img.view(img.shape[0], -1)
-        x = self.model(img_flat)
+        self.model.apply(weight_init)
+
+    def forward(self, img): 
+        if self.conv:
+            x = self.model(img)
+        else:
+            img_flat = img.reshape((img.shape[0], np.product(img.shape[1:])))
+            x = self.model(img_flat)
         mu = self.mu(x)
         logvar = self.logvar(x)
         z = reparameterization(mu, logvar, self.latent_dim)
